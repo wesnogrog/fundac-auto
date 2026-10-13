@@ -487,10 +487,18 @@ class AutoService : AccessibilityService() {
         return true
     }
 
+    /** Nomes longos rolam no campo e só o final fica visível: confere pelo começo OU pelo fim. */
     private fun fieldShows(text: String, fy: Float): Boolean {
-        val s = snap()
-        val probe = keyOf(text).take(10)
-        return s.lines.any { abs(it.box.centerY() - fy) < s.h * 0.03f && it.k.contains(probe) }
+        val full = keyOf(text)
+        val head = full.take(10)
+        val tail = full.takeLast(10)
+        repeat(2) {
+            val s = snap()
+            val row = s.lines.filter { abs(it.box.centerY() - fy) < s.h * 0.03f }.joinToString("") { it.k }
+            if (row.contains(head) || row.contains(tail)) return true
+            nap(400)
+        }
+        return false
     }
 
     private fun typeDigits(digits: String, w: Int, h: Int) {

@@ -11,8 +11,18 @@ android {
         applicationId = "br.com.surto.fundacauto"
         minSdk = 30
         targetSdk = 34
-        versionCode = 2
-        versionName = "2.0"
+        versionCode = 3
+        versionName = "2.1"
+    }
+
+    // chave fixa: as próximas versões instalam por cima, sem precisar desinstalar
+    signingConfigs {
+        getByName("debug") {
+            storeFile = file("debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
     }
 
     compileOptions {
