@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Fundac Auto</string>
+    <string name="service_desc">Lê a tela do app da Fundac e toca nos botões para lançar produtos e valores da lista que você colou no Fundac Auto.</string>
+</resources>
