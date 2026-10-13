@@ -4,33 +4,55 @@ import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
 import android.content.ClipData
 import android.content.ClipboardManager
+import android.graphics.Bitmap
 import android.graphics.Path
 import android.graphics.PixelFormat
 import android.graphics.Rect
-import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.view.Display
 import android.view.Gravity
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import android.view.accessibility.AccessibilityWindowInfo
 import android.widget.Button
 import android.widget.Toast
+import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.text.TextRecognition
+import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import java.text.Normalizer
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import kotlin.math.abs
 
+/**
+ * O app da Fundac desenha tudo numa única View (o Android não enxerga botões nem textos).
+ * Por isso este serviço: tira print da tela, lê o texto com OCR (ML Kit), toca nas posições
+ * encontradas e cola o texto usando a área de transferência do teclado.
+ */
 class AutoService : AccessibilityService() {
 
     private class Stopped : RuntimeException()
     private class Fail(msg: String) : RuntimeException(msg)
 
+    private class Row(val text: String, val box: Rect) {
+        val k: String = AutoService.keyOf(text)
+    }
+
+    private class Shot(val w: Int, val h: Int, val lines: List<Row>, val blocks: List<Row>)
+
     private val ui = Handler(Looper.getMainLooper())
+    private val exec = Executors.newSingleThreadExecutor()
     private var button: Button? = null
-    @Volatile private var targetPkg: String? = null
+    private var lastGrab = 0L
+    @Volatile private var lastShot: Shot? = null
+    private val recognizer by lazy { TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS) }
 
     companion object {
+        const val FUNDAC = "com.br.Fundacte"
         @Volatile var instance: AutoService? = null
         private val DIAC = Regex("\\p{Mn}+")
         private val SPACES = Regex("\\s+")
@@ -42,6 +64,10 @@ class AutoService : AccessibilityService() {
                 .replace('–', '-').replace('—', '-').replace('‑', '-')
             return SPACES.replace(t, " ").trim()
         }
+
+        /** Chave tolerante a erros de leitura (l/1/i, 0/o, pontuação). */
+        fun keyOf(s: String): String =
+            norm(s).filter { it.isLetterOrDigit() }.replace('l', 'i').replace('1', 'i').replace('0', 'o')
     }
 
     // ---------------------------------------------------------------- ciclo de vida
@@ -58,7 +84,7 @@ class AutoService : AccessibilityService() {
         State.stopRequested = true
         try {
             button?.let { (getSystemService(WINDOW_SERVICE) as WindowManager).removeView(it) }
-        } catch (_: Exception) {
+        } catch (e: Exception) {
         }
         button = null
         instance = null
@@ -73,6 +99,10 @@ class AutoService : AccessibilityService() {
         val b = Button(this)
         b.textSize = 12f
         b.isAllCaps = false
+        b.minWidth = 0
+        b.minimumWidth = 0
+        b.setPadding(24, 8, 24, 8)
+        b.alpha = 0.9f
         b.setOnClickListener { onButtonTap() }
         b.setOnLongClickListener { dumpScreen(); true }
         val lp = WindowManager.LayoutParams(
@@ -83,6 +113,7 @@ class AutoService : AccessibilityService() {
             PixelFormat.TRANSLUCENT
         )
         lp.gravity = Gravity.END or Gravity.CENTER_VERTICAL
+        lp.y = 700   // abaixo do meio da tela, longe dos botões que o app toca
         wm.addView(b, lp)
         button = b
         refreshButton()
@@ -93,10 +124,10 @@ class AutoService : AccessibilityService() {
             val b = button ?: return@post
             val total = State.items.size
             b.text = when {
-                State.running -> "⏸ PARAR ${State.index}/$total"
-                total == 0 -> "▶ sem lista"
-                State.index >= total -> "✔ fim ${State.index}/$total"
-                else -> "▶ LANÇAR ${State.index}/$total"
+                State.running -> "⏸ ${State.index}/$total"
+                total == 0 -> "▶ -"
+                State.index >= total -> "✔ $total"
+                else -> "▶ ${State.index}/$total"
             }
         }
     }
@@ -121,7 +152,6 @@ class AutoService : AccessibilityService() {
         }
         State.running = true
         State.stopRequested = false
-        targetPkg = null
         refreshButton()
         Thread { runLoop() }.apply { isDaemon = true }.start()
     }
@@ -130,6 +160,7 @@ class AutoService : AccessibilityService() {
 
     private fun runLoop() {
         val msg = try {
+            guard()
             while (State.index < State.items.size) {
                 if (State.stopRequested) throw Stopped()
                 val item = State.items[State.index]
@@ -140,16 +171,22 @@ class AutoService : AccessibilityService() {
                 else State.skipped.add("${item.name} — $skip")
                 State.index++
                 refreshButton()
-                Thread.sleep(300)
+                nap(300)
             }
-            if (onSearch()) performGlobalAction(GLOBAL_ACTION_BACK)
+            try {
+                val s = snap()
+                if (s.isSearch()) performGlobalAction(GLOBAL_ACTION_BACK)
+            } catch (e: Exception) {
+            }
             "Terminou: ${State.done.size} lançados, ${State.skipped.size} não lançados."
         } catch (e: Stopped) {
             "Parado por você no item ${State.index + 1}."
         } catch (e: Fail) {
-            "Parei no item ${State.index + 1}: ${e.message}"
+            copyDiag(e.message.orEmpty())
+            "Parei no item ${State.index + 1}: ${e.message} (diagnóstico copiado: cole no chat do Claude)"
         } catch (e: Exception) {
-            "Erro inesperado: ${e.javaClass.simpleName} ${e.message}"
+            copyDiag("${e.javaClass.simpleName} ${e.message}")
+            "Erro inesperado: ${e.javaClass.simpleName} ${e.message} (diagnóstico copiado)"
         }
         State.running = false
         State.status = msg
@@ -159,151 +196,224 @@ class AutoService : AccessibilityService() {
 
     /** Devolve null se lançou; ou o motivo de ter pulado o produto. */
     private fun processItem(item: Item): String? {
-        dismissWarning(0)
+        val s = ensureSearch()
+        val fx = s.w * 0.5f
+        val fy = s.h * 0.248f
+        val nameKey = keyOf(item.name)
 
-        if (targetPkg == null) {
-            if (!waitUntil(6000) { onSearch() || findAdd() != null })
-                throw Fail("não achei a tela da loja. Deixe a loja aberta na aba PRODUTOS e toque no botão de novo.")
-            targetPkg = root()?.packageName?.toString()
+        // apaga texto antigo da busca (botão X)
+        val hasText = s.lines.any {
+            abs(it.box.centerY() - fy) < s.h * 0.02f &&
+                it.box.centerX() > s.w * 0.12f && it.box.centerX() < s.w * 0.88f
+        }
+        if (hasText) {
+            tapAt(s.w * 0.93f, fy)
+            nap(500)
         }
 
-        // 1) chegar na tela de busca de produtos
-        if (!onSearch()) {
-            if (!waitUntil(6000) { onSearch() || findAdd() != null })
-                throw Fail("não achei o botão + Adicionar.")
-            if (!onSearch()) {
-                val add = findAdd() ?: throw Fail("não achei o botão + Adicionar.")
-                if (!clickAndWait(add) { onSearch() })
-                    throw Fail("toquei em + Adicionar, mas a busca de produtos não abriu.")
-            }
-        }
+        // cola o nome na busca
+        if (!pasteInto(item.name, fx, fy))
+            throw Fail("não consegui colocar o nome do produto na busca (o teclado não deixou colar).")
+        nap(900)
 
-        // 2) colar o nome na busca
-        val field = waitFor(4000) { root()?.let { r -> findFirst(r) { it.isEditable && it.isVisibleToUser } } }
-            ?: throw Fail("não achei o campo de busca.")
-        val nameN = norm(item.name)
-        if (!fill(field, item.name) { norm(it) == nameN })
-            throw Fail("não consegui colar o nome do produto na busca.")
-
-        // 3) escolher o resultado (ignora "pack")
-        Thread.sleep(700)
-        var cands: List<AccessibilityNodeInfo> = emptyList()
-        var lastKey = ""
-        var stable = 0
-        val end = SystemClock.uptimeMillis() + 5000
+        // lê os resultados até ficarem estáveis
+        var cands: List<Row> = emptyList()
+        var lastKeys = ""
+        val end = SystemClock.uptimeMillis() + 6000
         while (SystemClock.uptimeMillis() < end) {
-            if (State.stopRequested) throw Stopped()
-            val r = root()
-            val list = if (r == null) emptyList() else
-                findAll(r) { !it.isEditable && it.isVisibleToUser && norm(txt(it)).contains(nameN) }
-                    .distinctBy { norm(txt(it)) }
-            val key = list.joinToString("|") { txt(it) }
-            if (list.isNotEmpty()) cands = list
-            if (list.isNotEmpty() && key == lastKey) {
-                stable++
-                if (stable >= 2) break
-            } else {
-                stable = 0
-                lastKey = key
+            val sh = snap()
+            val list = sh.blocks.filter {
+                it.box.centerY() > fy + sh.h * 0.03f && it.box.centerY() < sh.h * 0.86f && it.k.contains(nameKey)
             }
-            Thread.sleep(350)
+            val keys = list.joinToString("|") { it.k }
+            if (list.isNotEmpty()) cands = list
+            if (list.isNotEmpty() && keys == lastKeys) break
+            lastKeys = keys
+            nap(300)
         }
         if (cands.isEmpty()) return "não apareceu na busca"
-        val nonPack = cands.filter { !norm(txt(it)).contains("pack") }
+
+        val nonPack = cands.filter { !it.k.contains("pack") }
         if (nonPack.isEmpty()) return "só apareceu versão pack"
-        val chosen = when {
+        val chosen: Row = when {
             nonPack.size == 1 -> nonPack[0]
-            else -> nonPack.filter { PREFIX.replace(norm(txt(it)), "") == nameN }.singleOrNull()
+            else -> nonPack.filter { keyOf(PREFIX.replace(norm(it.text), "")) == nameKey }.singleOrNull()
         } ?: return "vários resultados (${nonPack.size}) sem pack"
 
-        if (!clickAndWait(chosen) { onDialog() })
-            throw Fail("toquei no produto, mas a tela de valor não abriu.")
+        tapRow(chosen)
+        val d = waitShot(7000) { it.isDialog() }
+            ?: throw Fail("toquei no produto, mas a tela de valor não abriu.")
 
-        // 4) valor
-        val vf = waitFor(3000) { findValueField() } ?: throw Fail("não achei o campo Valor.")
+        // valor
+        val label = d.lines.firstOrNull { it.k == keyOf("valor") && it.box.centerX() < d.w * 0.5f }
+        val vx = label?.box?.centerX()?.toFloat() ?: (d.w * 0.22f)
+        val vy = (label?.box?.centerY()?.toFloat() ?: (d.h * 0.256f)) + d.h * 0.035f
+        tapAt(vx, vy)
+        nap(900)
+        typeDigits(item.digits, d.w, d.h)
+        nap(400)
+
+        val v = snap()
+        val read = v.lines
+            .filter { it.box.centerX() < v.w * 0.5f && abs(it.box.centerY() - vy) < v.h * 0.045f }
+            .joinToString("") { it.text }
+            .filter { it.isDigit() }
+            .trimStart('0')
         val want = item.digits.trimStart('0')
-        val ok = fill(vf, item.digits) { it.filter(Char::isDigit).trimStart('0') == want }
-        if (!ok) {
-            root()?.let { r -> findFirst(r) { txt(it).trim().equals("Cancelar", true) } }?.let { clickNode(it) }
-            Thread.sleep(500)
-            return "o campo Valor não aceitou ${item.price}"
+        if (read.isNotEmpty() && read != want) {
+            v.lines.firstOrNull { it.k == keyOf("cancelar") }?.let { tapRow(it) }
+            nap(700)
+            return "o campo Valor ficou com $read em vez de $want"
         }
 
-        // 5) salvar
-        val save = waitFor(2000) { root()?.let { r -> findFirst(r) { txt(it).trim().equals("Salvar", true) } } }
-            ?: throw Fail("não achei o botão Salvar.")
-        if (!clickAndWait(save) { !onDialog() })
-            throw Fail("toquei em Salvar, mas a tela de valor não fechou.")
+        val sv = v.lines.firstOrNull { it.k == keyOf("salvar") } ?: throw Fail("não achei o botão Salvar.")
+        tapRow(sv)
 
-        // 6) aviso "gravado com advertência" -> OK
-        dismissWarning(2500)
+        val a = waitShot(7000) { it.isWarn() || it.isSearch() || it.addButton() != null }
+            ?: throw Fail("toquei em Salvar, mas a tela de valor não fechou.")
+        if (a.isWarn()) dismissWarn(a)
         return null
     }
 
-    private fun dismissWarning(waitMs: Long) {
-        val end = SystemClock.uptimeMillis() + waitMs
-        do {
-            val r = root()
-            if (r != null) {
-                val warn = findFirst(r) {
-                    val t = norm(txt(it))
-                    t.contains("advertencia") || t.contains("possivelmente discrepante")
-                }
-                if (warn != null) {
-                    val ok = findFirst(r) { txt(it).trim().equals("OK", true) && it.isVisibleToUser }
-                    if (ok != null) {
-                        clickAndWait(ok) {
-                            val r2 = root()
-                            r2 == null || findFirst(r2) { n -> norm(txt(n)).contains("advertencia") } == null
-                        }
-                        Thread.sleep(300)
-                        return
-                    }
-                }
+    /** Garante que está na tela de busca de produtos (abre pelo + Adicionar se preciso). */
+    private fun ensureSearch(): Shot {
+        repeat(3) {
+            val s = waitShot(10000) { it.isWarn() || it.isDialog() || it.isSearch() || it.addButton() != null }
+                ?: throw Fail("não reconheci a tela da loja. Deixe a loja aberta na aba PRODUTOS e toque no botão de novo.")
+            when {
+                s.isWarn() -> dismissWarn(s)
+                s.isDialog() -> throw Fail("a tela de valor já estava aberta. Cancele e deixe a loja na aba PRODUTOS.")
+                s.isSearch() -> return s
+                else -> tapRow(s.addButton()!!)
             }
-            if (State.stopRequested) throw Stopped()
-            if (waitMs > 0) Thread.sleep(250)
-        } while (SystemClock.uptimeMillis() < end)
-    }
-
-    // ---------------------------------------------------------------- telas
-
-    private fun root(): AccessibilityNodeInfo? {
-        val r = rootInActiveWindow ?: return null
-        val p = r.packageName?.toString()
-        if (p == packageName) return null
-        val t = targetPkg
-        if (t != null && p != t) return null
-        return r
-    }
-
-    private fun findAdd(): AccessibilityNodeInfo? =
-        root()?.let { r -> findFirst(r) { txt(it).replace(" ", "").equals("+Adicionar", true) && it.isVisibleToUser } }
-
-    private fun onSearch(): Boolean =
-        root()?.let { r -> findFirst(r) { txt(it).trim().equals("Filtro Livre", true) } } != null
-
-    private fun onDialog(): Boolean {
-        val r = root() ?: return false
-        return findFirst(r) { txt(it).trim().equals("Salvar", true) } != null &&
-            findFirst(r) { it.isEditable } != null
-    }
-
-    private fun findValueField(): AccessibilityNodeInfo? {
-        val r = root() ?: return null
-        val eds = findAll(r) { it.isEditable && it.isVisibleToUser }
-        if (eds.isEmpty()) return null
-        val half = resources.displayMetrics.widthPixels / 2
-        fun b(n: AccessibilityNodeInfo): Rect {
-            val x = Rect()
-            n.getBoundsInScreen(x)
-            return x
+            nap(600)
         }
-        val left = eds.filter { b(it).centerX() < half }.ifEmpty { eds }
-        return left.minByOrNull { b(it).top }
+        throw Fail("não consegui abrir a busca de produtos.")
     }
 
-    // ---------------------------------------------------------------- utilidades de nós
+    private fun dismissWarn(s: Shot) {
+        val ok = s.lines.filter { it.k == keyOf("OK") }.maxByOrNull { it.box.centerY() }
+        if (ok != null) tapRow(ok) else tapAt(s.w * 0.81f, s.h * 0.573f)
+        nap(700)
+    }
+
+    // ---------------------------------------------------------------- telas (por OCR)
+
+    private fun Shot.hasAny(vararg parts: String): Boolean =
+        lines.any { l -> parts.any { p -> l.k.contains(keyOf(p)) } }
+
+    private fun Shot.isSearch() = hasAny("filtro livre")
+    private fun Shot.isDialog() = hasAny("salvar") && hasAny("cancelar")
+    private fun Shot.isWarn() = hasAny("advertencia", "discrepante")
+    private fun Shot.addButton(): Row? =
+        lines.firstOrNull { it.k.contains(keyOf("adicionar")) && it.box.centerY() < h * 0.2 }
+
+    private fun waitShot(ms: Long, pred: (Shot) -> Boolean): Shot? {
+        val end = SystemClock.uptimeMillis() + ms
+        while (true) {
+            if (State.stopRequested) throw Stopped()
+            guard()
+            val s = snap()
+            if (pred(s)) return s
+            if (SystemClock.uptimeMillis() >= end) return null
+            nap(150)
+        }
+    }
+
+    private fun guard() {
+        val p = rootInActiveWindow?.packageName?.toString() ?: return
+        val ok = p == FUNDAC || p.contains("keyboard") || p.contains("honeyboard") ||
+            p.contains("inputmethod") || p.contains("systemui") || p.contains("gboard") || p.contains("latin")
+        if (!ok) throw Fail("saí do app da Fundac (apareceu $p). Volte para a loja e toque no botão de novo.")
+    }
+
+    // ---------------------------------------------------------------- print + OCR
+
+    private fun grab(): Bitmap? {
+        repeat(4) {
+            val wait = 450 - (SystemClock.uptimeMillis() - lastGrab)
+            if (wait > 0) Thread.sleep(wait)
+            val latch = CountDownLatch(1)
+            var bmp: Bitmap? = null
+            lastGrab = SystemClock.uptimeMillis()
+            takeScreenshot(Display.DEFAULT_DISPLAY, exec, object : TakeScreenshotCallback {
+                override fun onSuccess(r: ScreenshotResult) {
+                    try {
+                        val hb = r.hardwareBuffer
+                        bmp = Bitmap.wrapHardwareBuffer(hb, r.colorSpace)?.copy(Bitmap.Config.ARGB_8888, false)
+                        hb.close()
+                    } catch (e: Exception) {
+                    }
+                    latch.countDown()
+                }
+
+                override fun onFailure(errorCode: Int) {
+                    latch.countDown()
+                }
+            })
+            latch.await(5, TimeUnit.SECONDS)
+            if (bmp != null) return bmp
+        }
+        return null
+    }
+
+    private fun ocr(bmp: Bitmap): Pair<List<Row>, List<Row>> {
+        val latch = CountDownLatch(1)
+        var res: com.google.mlkit.vision.text.Text? = null
+        recognizer.process(InputImage.fromBitmap(bmp, 0))
+            .addOnSuccessListener { res = it; latch.countDown() }
+            .addOnFailureListener { latch.countDown() }
+        latch.await(15, TimeUnit.SECONDS)
+        val lines = ArrayList<Row>()
+        val blocks = ArrayList<Row>()
+        val r = res
+        if (r != null) {
+            for (b in r.textBlocks) {
+                b.boundingBox?.let { blocks.add(Row(b.text.replace('\n', ' '), it)) }
+                for (l in b.lines) l.boundingBox?.let { lines.add(Row(l.text, it)) }
+            }
+        }
+        return Pair(lines, blocks)
+    }
+
+    private fun snap(): Shot {
+        val bmp = grab() ?: throw Fail("o Android não deixou tirar print da tela.")
+        val (lines, blocks) = ocr(bmp)
+        val s = Shot(bmp.width, bmp.height, lines, blocks)
+        bmp.recycle()
+        lastShot = s
+        return s
+    }
+
+    // ---------------------------------------------------------------- toques e digitação
+
+    private fun nap(ms: Long) {
+        Thread.sleep(ms)
+        if (State.stopRequested) throw Stopped()
+    }
+
+    private fun tapAt(x: Float, y: Float, hold: Long = 70) {
+        val path = Path().apply { moveTo(x, y) }
+        val g = GestureDescription.Builder()
+            .addStroke(GestureDescription.StrokeDescription(path, 0, hold)).build()
+        val latch = CountDownLatch(1)
+        val sent = dispatchGesture(g, object : GestureResultCallback() {
+            override fun onCompleted(d: GestureDescription?) { latch.countDown() }
+            override fun onCancelled(d: GestureDescription?) { latch.countDown() }
+        }, null)
+        if (sent) latch.await(hold / 1000 + 3, TimeUnit.SECONDS)
+        nap(250)
+    }
+
+    private fun tapRow(r: Row) = tapAt(r.box.exactCenterX(), r.box.exactCenterY())
+
+    private fun setClip(t: String) {
+        val cm = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+        cm.setPrimaryClip(ClipData.newPlainText("fundac", t))
+    }
+
+    private fun imeWindow(): AccessibilityWindowInfo? =
+        windows.firstOrNull { it.type == AccessibilityWindowInfo.TYPE_INPUT_METHOD }
 
     private fun txt(n: AccessibilityNodeInfo): String =
         (n.text ?: n.contentDescription)?.toString().orEmpty()
@@ -322,108 +432,147 @@ class AutoService : AccessibilityService() {
     private fun findFirst(root: AccessibilityNodeInfo, pred: (AccessibilityNodeInfo) -> Boolean): AccessibilityNodeInfo? =
         findAll(root, pred).firstOrNull()
 
-    private fun <T> waitFor(ms: Long, f: () -> T?): T? {
-        val end = SystemClock.uptimeMillis() + ms
-        while (true) {
-            if (State.stopRequested) throw Stopped()
-            val v = f()
-            if (v != null) return v
-            if (SystemClock.uptimeMillis() >= end) return null
-            Thread.sleep(250)
-        }
+    private fun tapNode(n: AccessibilityNodeInfo) {
+        val r = Rect()
+        n.getBoundsInScreen(r)
+        tapAt(r.exactCenterX(), r.exactCenterY())
     }
 
-    private fun waitUntil(ms: Long, c: () -> Boolean): Boolean = waitFor(ms) { if (c()) true else null } ?: false
-
-    private fun clickNode(n: AccessibilityNodeInfo): Boolean {
+    private fun clickNode(n: AccessibilityNodeInfo) {
         var c: AccessibilityNodeInfo? = n
         var depth = 0
         while (c != null && depth < 6) {
-            if (c.isClickable && c.isEnabled && c.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true
+            if (c.isClickable && c.isEnabled && c.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return
             c = c.parent
             depth++
         }
-        return tapNode(n)
-    }
-
-    private fun tapNode(n: AccessibilityNodeInfo): Boolean {
-        val r = Rect()
-        n.getBoundsInScreen(r)
-        val path = Path().apply { moveTo(r.exactCenterX(), r.exactCenterY()) }
-        val g = GestureDescription.Builder()
-            .addStroke(GestureDescription.StrokeDescription(path, 0, 60)).build()
-        var ok = false
-        val latch = CountDownLatch(1)
-        dispatchGesture(g, object : GestureResultCallback() {
-            override fun onCompleted(d: GestureDescription?) { ok = true; latch.countDown() }
-            override fun onCancelled(d: GestureDescription?) { latch.countDown() }
-        }, null)
-        latch.await(2, TimeUnit.SECONDS)
-        return ok
-    }
-
-    /** Clica; se a tela esperada não aparecer em 3s, tenta de novo com um toque por coordenada. */
-    private fun clickAndWait(n: AccessibilityNodeInfo, cond: () -> Boolean): Boolean {
-        clickNode(n)
-        if (waitUntil(3000, cond)) return true
         tapNode(n)
-        return waitUntil(3000, cond)
     }
 
-    private fun setText(n: AccessibilityNodeInfo, s: String): Boolean {
-        val b = Bundle()
-        b.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, s)
-        return n.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, b)
-    }
-
-    private fun setClip(t: String) {
-        val cm = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
-        cm.setPrimaryClip(ClipData.newPlainText("fundac", t))
-    }
-
-    /** Limpa o campo, cola o texto (como você faz à mão) e confere; se falhar, tenta escrever direto. */
-    private fun fill(field: AccessibilityNodeInfo, text: String, ok: (String) -> Boolean): Boolean {
-        field.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
-        field.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-        Thread.sleep(250)
-        setText(field, "")
-        Thread.sleep(200)
+    /** Foca o campo, cola o texto pela área de transferência do teclado e confere por OCR. */
+    private fun pasteInto(text: String, fx: Float, fy: Float): Boolean {
         setClip(text)
-        field.refresh()
-        field.performAction(AccessibilityNodeInfo.ACTION_PASTE)
-        Thread.sleep(500)
-        field.refresh()
-        if (ok(field.text?.toString().orEmpty())) return true
-        setText(field, text)
-        Thread.sleep(500)
-        field.refresh()
-        return ok(field.text?.toString().orEmpty())
+        tapAt(fx, fy)
+        nap(900)
+        if (pasteViaKeyboard(text) && fieldShows(text, fy)) return true
+        if (pasteViaLongPress(fx, fy) && fieldShows(text, fy)) return true
+        return false
     }
 
-    // ---------------------------------------------------------------- diagnóstico (segurar o botão)
+    private fun pasteViaKeyboard(text: String): Boolean {
+        val w = imeWindow() ?: return false
+        val root = w.root ?: return false
+        val b = Rect()
+        w.getBoundsInScreen(b)
+        val icon = findFirst(root) {
+            val k = norm(txt(it))
+            k.contains("area de transferencia") || k.contains("clipboard") || k.contains("prancheta")
+        }
+        if (icon != null) clickNode(icon)
+        else tapAt(b.left + b.width() * 0.264f, b.top + 65f * b.width() / 1080f)
+        nap(800)
+        val root2 = imeWindow()?.root ?: return false
+        val probe = norm(text).take(10)
+        val item = findFirst(root2) { !it.isEditable && norm(txt(it)).contains(probe) } ?: return false
+        clickNode(item)
+        nap(600)
+        return true
+    }
 
+    private fun pasteViaLongPress(fx: Float, fy: Float): Boolean {
+        tapAt(fx, fy, 800)
+        val s = waitShot(2500) { sh -> sh.lines.any { it.k == keyOf("colar") } } ?: return false
+        tapRow(s.lines.first { it.k == keyOf("colar") })
+        nap(500)
+        return true
+    }
+
+    private fun fieldShows(text: String, fy: Float): Boolean {
+        val s = snap()
+        val probe = keyOf(text).take(10)
+        return s.lines.any { abs(it.box.centerY() - fy) < s.h * 0.03f && it.k.contains(probe) }
+    }
+
+    private fun typeDigits(digits: String, w: Int, h: Int) {
+        for (ch in digits) {
+            val root = imeWindow()?.root
+            val node = root?.let { r -> findFirst(r) { txt(it).trim() == ch.toString() } }
+            if (node != null) {
+                clickNode(node)
+            } else {
+                val col = when (ch) {
+                    '1', '4', '7' -> 0.134f
+                    '2', '5', '8', '0' -> 0.379f
+                    else -> 0.620f
+                }
+                val row = when (ch) {
+                    '1', '2', '3' -> 0.673f
+                    '4', '5', '6' -> 0.746f
+                    '7', '8', '9' -> 0.820f
+                    else -> 0.894f
+                }
+                tapAt(w * col, h * row)
+            }
+            nap(180)
+        }
+    }
+
+    // ---------------------------------------------------------------- diagnóstico
+
+    private fun failDiag(msg: String): String {
+        val sb = StringBuilder("FALHA: $msg\n")
+        lastShot?.let { s ->
+            sb.append("tela ${s.w}x${s.h}\nOCR (linhas):\n")
+            s.lines.forEach { sb.append(it.text).append("  @").append(it.box.flattenToString()).append('\n') }
+        }
+        return sb.toString()
+    }
+
+    private fun copyDiag(msg: String) {
+        val d = failDiag(msg)
+        ui.post { setClip(d) }
+    }
+
+    /** Segurar o botão flutuante: copia janelas, teclado e texto lido da tela. */
     private fun dumpScreen() {
         Thread {
-            val r = rootInActiveWindow
             val sb = StringBuilder()
-            sb.append("pacote: ").append(r?.packageName).append('\n')
-            var count = 0
-            fun go(n: AccessibilityNodeInfo?, depth: Int) {
-                if (n == null || count > 400 || depth > 40) return
-                count++
-                val b = Rect()
-                n.getBoundsInScreen(b)
-                sb.append("  ".repeat(depth.coerceAtMost(10)))
-                    .append(n.className).append(" | txt=").append(n.text)
-                    .append(" | desc=").append(n.contentDescription)
-                    .append(" | ").append(if (n.isEditable) "E" else "").append(if (n.isClickable) "C" else "")
-                    .append(" | ").append(b.flattenToString()).append('\n')
-                for (i in 0 until n.childCount) go(n.getChild(i), depth + 1)
+            sb.append("pacote ativo: ").append(rootInActiveWindow?.packageName).append('\n')
+            try {
+                for (w in windows) {
+                    val b = Rect()
+                    w.getBoundsInScreen(b)
+                    sb.append("janela tipo=").append(w.type).append(' ').append(b.flattenToString())
+                        .append(" ativa=").append(w.isActive).append('\n')
+                    if (w.type == AccessibilityWindowInfo.TYPE_INPUT_METHOD) {
+                        var count = 0
+                        fun go(n: AccessibilityNodeInfo?, depth: Int) {
+                            if (n == null || count > 150 || depth > 30) return
+                            count++
+                            val nb = Rect()
+                            n.getBoundsInScreen(nb)
+                            sb.append("   ").append(n.className).append(" | txt=").append(n.text)
+                                .append(" | desc=").append(n.contentDescription)
+                                .append(" | ").append(nb.flattenToString()).append('\n')
+                            for (i in 0 until n.childCount) go(n.getChild(i), depth + 1)
+                        }
+                        go(w.root, 0)
+                    }
+                }
+            } catch (e: Exception) {
+                sb.append("erro janelas: ").append(e.message).append('\n')
             }
-            go(r, 0)
+            try {
+                val s = snap()
+                sb.append("--- OCR ").append(s.w).append('x').append(s.h).append(" ---\n")
+                s.lines.forEach { sb.append(it.text).append("  @").append(it.box.flattenToString()).append('\n') }
+            } catch (e: Exception) {
+                sb.append("OCR falhou: ").append(e.message).append('\n')
+            }
+            val out = sb.toString()
             ui.post {
-                setClip(sb.toString())
-                Toast.makeText(applicationContext, "Diagnóstico copiado ($count itens). Cole no chat do Claude.", Toast.LENGTH_LONG).show()
+                setClip(out)
+                Toast.makeText(applicationContext, "Diagnóstico copiado. Cole no chat do Claude.", Toast.LENGTH_LONG).show()
             }
         }.start()
     }

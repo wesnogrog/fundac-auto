@@ -80,7 +80,7 @@ class MainActivity : Activity() {
         preview = tv("")
         col.addView(preview)
 
-        col.addView(tv("3) Abra a loja no app da Fundac, aba PRODUTOS, e toque no botão flutuante ▶ LANÇAR (lado direito da tela). Para parar, toque nele de novo. Segurando o botão por 2 segundos, o app copia um diagnóstico da tela."))
+        col.addView(tv("3) Abra a loja no app da Fundac, aba PRODUTOS, e toque no botão flutuante ▶ (lado direito, abaixo do meio da tela). Para parar, toque nele de novo. Segurando o botão por 2 segundos, o app copia um diagnóstico. Se falhar, ele também copia o diagnóstico sozinho: cole no chat do Claude."))
         statusView = tv("")
         col.addView(statusView)
         col.addView(bt("Copiar lista de não lançados") {
